@@ -28,7 +28,7 @@ When the agent requests elevated access via `POST /api/grants/request`, the appr
 
 The agent can either:
 - **Poll** `GET /api/grants/:id` until `status` changes from `pending`
-- **Provide a `callbackUrl`** in the grant request — the proxy will POST to it on approval or denial (see [Callback](#grant-approval-callback) below)
+- **Receive a callback** — the proxy automatically fires a POST to the configured callback URL on approval or denial (see [Callback](#grant-approval-callback) below). Set `callback: false` in the grant request to suppress this.
 
 ## API Reference
 
@@ -262,8 +262,7 @@ Request body:
   "messageId": "abc123",
   "description": "Read flight confirmation",
   "durationMinutes": 10,
-  "callbackUrl": "https://openclaw.example.com/hooks/gmail-grant",
-  "callbackCfAuth": true
+  "callbackSessionKey": "sess_abc123"
 }
 ```
 
@@ -274,9 +273,7 @@ Request body:
 | `query` | string | Level 2 only | Gmail search query |
 | `description` | string | yes | Human-readable reason (shown to approver) |
 | `durationMinutes` | int | no | Requested duration (capped at 1440). Defaults: L1=5, L2=30, L3=15 |
-| `callbackUrl` | string | no | URL to POST when grant is approved or denied |
-| `callbackCfAuth` | bool | no | If true, include Cloudflare Access service token headers on the callback |
-| `callbackToken` | string | no | Bearer token to include as `Authorization: Bearer <token>` on the callback |
+| `callback` | bool | no | Set to false to suppress callback on approval/denial (default: true) |
 | `callbackSessionKey` | string | no | Opaque session key included in callback payload for routing to the requesting session |
 
 Response:
@@ -292,7 +289,7 @@ Response:
 
 #### `GET /api/grants/:id`
 
-Check grant status. Use this to poll if no `callbackUrl` was provided.
+Check grant status. Use this to poll if callbacks are suppressed.
 
 Response:
 ```json
@@ -307,8 +304,7 @@ Response:
   "approved_at": "2026-03-23T19:37:01.964774+00:00",
   "expires_at": "2026-03-23T19:42:01.964774+00:00",
   "duration_minutes": 10,
-  "metadata": "{...}",
-  "callback_url": "https://openclaw.example.com/hooks/gmail-grant"
+  "metadata": "{...}"
 }
 ```
 
@@ -339,12 +335,17 @@ Response:
 
 ### Grant Approval Callback
 
-If a `callbackUrl` is provided in the grant request, the proxy POSTs to it when the grant is approved or denied.
+The callback URL and authentication are configured server-side in `config.json`, not per-request. When a grant is approved or denied, the proxy automatically POSTs to the configured URL unless the grant request set `callback: false`.
+
+- The callback URL is set in `config.json` under `callback.url`
+- If `callback.cf_auth` is `true` in config, the proxy includes `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers on the callback (credentials loaded from Vault)
+- A Bearer token is loaded from Vault (path configured in `callback.hooks_token_vault_path`, field: `hooks_token`) and sent as `Authorization: Bearer <token>`
 
 Callback request:
 ```json
-POST <callbackUrl>
+POST <callback.url>
 Content-Type: application/json
+Authorization: Bearer <hooks_token>
 
 {
   "grantId": "g_11155f2e244bc44e",
@@ -355,8 +356,6 @@ Content-Type: application/json
 ```
 
 For denials, `status` is `"denied"` and `expiresAt` is omitted.
-
-If `callbackCfAuth: true` was set in the grant request, the proxy includes `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers on the callback. The credentials are loaded from `secret/gmail-proxy` in Vault (fields: `CF-Access-Client-Id`, `CF-Access-Client-Secret`).
 
 ### Audit Log
 
@@ -423,7 +422,9 @@ Key fields:
 | `signal.approver` | Signal phone number of the human approver |
 | `signal.webhook_token` | Token for authenticating Signal webhook callbacks. **Must be URL-safe** — generate with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`. Set the same value in the `RECEIVE_WEBHOOK_URL` query string in `docker-compose.yml`. |
 | `approval_url_base` | Public URL of the proxy (used in approval links) |
-| `allowed_callback_domains` | List of domains allowed for grant approval callbacks |
+| `callback.url` | URL to POST grant status on approval/denial |
+| `callback.cf_auth` | Include CF Access headers on callbacks (bool) |
+| `callback.hooks_token_vault_path` | Vault path for the hooks Bearer token (field: `hooks_token`) |
 
 See `config.json.example` for the full schema including rate limits, default grant durations, and sensitive pattern configuration.
 
@@ -529,5 +530,5 @@ Agent ──(CF Tunnel / direct)──▶ Email Proxy (:18795) ──OAuth──
                           │
                           ├──HTTP──▶ Vault (AppRole auth → secrets)
                           │
-                          └──HTTPS──▶ callbackUrl (optional, on grant approval/denial)
+                          └──HTTPS──▶ callback URL (configured, on grant approval/denial)
 ```

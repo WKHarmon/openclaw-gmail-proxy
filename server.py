@@ -3,7 +3,6 @@
 
 import asyncio
 import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -19,8 +18,6 @@ from fnmatch import fnmatch
 from html import escape
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
-
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -53,12 +50,10 @@ VAULT_ENABLED = bool(VAULT_ROLE_ID and VAULT_SECRET_ID)
 _api_key: str = ""
 _callback_cf_client_id: str = ""
 _callback_cf_client_secret: str = ""
+_callback_hooks_token: str = ""
 
 # CSRF tokens for approval forms: approval_token -> (csrf_token, expiry_monotonic)
 _csrf_tokens: dict[str, tuple[str, float]] = {}
-
-# In-memory cache of raw callback tokens (grant_id -> token); not persisted across restarts
-_pending_callback_tokens: dict[str, str] = {}
 
 # Rate limiting for grant requests
 _grant_request_times: deque = deque()
@@ -312,36 +307,16 @@ async def send_signal_message(message: str):
 # ─── Grant Callback ──────────────────────────────────────────────────────────
 
 
-def _is_safe_callback_url(url: str) -> bool:
-    """Validate callback URL against allowlist (if configured) or block private networks."""
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    if parsed.scheme != "https":
-        return False
-    host = parsed.hostname or ""
-    if not host or "." not in host:
-        return False
-
-    # If an allowlist is configured, hostname must match exactly
-    allowed = CONFIG.get("allowed_callback_domains", [])
-    if allowed:
-        return host in allowed
-
-    # Fallback: block obviously internal hostnames
-    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-        return False
-    return True
-
-
 async def fire_grant_callback(grant: dict, status: str, expires_at: Optional[str] = None):
-    """POST to the grant's callback URL if one was provided."""
-    callback_url = grant.get("callback_url")
+    """POST grant status to the configured callback URL."""
+    callback_cfg = CONFIG.get("callback", {})
+    callback_url = callback_cfg.get("url", "")
     if not callback_url:
         return
-    if not _is_safe_callback_url(callback_url):
-        log.warning("Blocked callback to disallowed URL: %s", callback_url)
+
+    # Check if this grant opted out of callbacks
+    meta = json.loads(grant.get("metadata") or "{}")
+    if meta.get("callback") is False:
         return
 
     payload = {
@@ -351,21 +326,15 @@ async def fire_grant_callback(grant: dict, status: str, expires_at: Optional[str
     }
     if expires_at:
         payload["expiresAt"] = expires_at
-    headers: dict = {"Content-Type": "application/json"}
-    meta = json.loads(grant.get("metadata") or "{}")
-    # Pass session key through so the receiver can route to the right session
     if meta.get("callbackSessionKey"):
         payload["sessionKey"] = meta["callbackSessionKey"]
-    if meta.get("callbackCfAuth") and _callback_cf_client_id:
+
+    headers: dict = {"Content-Type": "application/json"}
+    if callback_cfg.get("cf_auth") and _callback_cf_client_id:
         headers["CF-Access-Client-Id"] = _callback_cf_client_id
         headers["CF-Access-Client-Secret"] = _callback_cf_client_secret
-    # Retrieve raw callback token from in-memory cache (only hash is in DB)
-    grant_id = grant["id"]
-    callback_token = _pending_callback_tokens.pop(grant_id, None)
-    if not callback_token and meta.get("callbackTokenHash"):
-        log.warning("Callback token for grant %s lost (server restart?); skipping Bearer header", grant_id)
-    if callback_token:
-        headers["Authorization"] = f"Bearer {callback_token}"
+    if _callback_hooks_token:
+        headers["Authorization"] = f"Bearer {_callback_hooks_token}"
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -376,19 +345,6 @@ async def fire_grant_callback(grant: dict, status: str, expires_at: Optional[str
                 log.info("Grant callback sent to %s (status=%s)", callback_url, status)
         except Exception as e:
             log.error("Grant callback error: %s", e)
-
-    # Scrub the callback token hash from stored metadata
-    if meta.get("callbackTokenHash"):
-        meta.pop("callbackTokenHash", None)
-        conn = db_conn()
-        try:
-            conn.execute(
-                "UPDATE grants SET metadata=? WHERE id=?",
-                (json.dumps(meta), grant_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
 
 # ─── Grant Helpers ────────────────────────────────────────────────────────────
 
@@ -568,7 +524,7 @@ def _message_matches_query(message_id: str, query: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _api_key, _callback_cf_client_id, _callback_cf_client_secret
+    global _api_key, _callback_cf_client_id, _callback_cf_client_secret, _callback_hooks_token
     if VAULT_ENABLED:
         api_key_path = CONFIG.get("vault_api_key_path", "")
         if api_key_path:
@@ -594,6 +550,21 @@ async def lifespan(app: FastAPI):
             log.info("Callback CF Access credentials loaded from Vault")
     except Exception as e:
         log.warning("Could not load callback CF credentials: %s", e)
+    # Load hooks token for grant callbacks
+    callback_cfg = CONFIG.get("callback", {})
+    hooks_vault_path = callback_cfg.get("hooks_token_vault_path", "")
+    if hooks_vault_path and VAULT_ENABLED:
+        try:
+            gw = vault_read_path(hooks_vault_path)
+            _callback_hooks_token = gw.get("hooks_token", "")
+            if _callback_hooks_token:
+                log.info("Callback hooks token loaded from Vault")
+        except Exception as e:
+            log.warning("Could not load hooks token from Vault: %s", e)
+    elif not VAULT_ENABLED:
+        _callback_hooks_token = os.environ.get("CALLBACK_HOOKS_TOKEN", "")
+        if _callback_hooks_token:
+            log.info("Callback hooks token loaded from environment")
     if not CONFIG.get("signal", {}).get("webhook_token"):
         log.warning("signal.webhook_token not set — webhook endpoint is unauthenticated")
     init_db()
@@ -1294,14 +1265,13 @@ MAX_GRANT_DURATION_MINUTES = 1440  # 24 hours
 
 
 class GrantRequest(BaseModel):
+    model_config = {"extra": "ignore"}
     level: int  # 1, 2, or 3
     messageId: Optional[str] = None
     query: Optional[str] = None
     description: str
     durationMinutes: Optional[int] = None
-    callbackUrl: Optional[str] = None
-    callbackCfAuth: bool = False
-    callbackToken: Optional[str] = None  # Bearer token to include on callback
+    callback: bool = True  # Set to false to suppress callback on approval/denial
     callbackSessionKey: Optional[str] = None  # Session key to include in callback payload
 
 
@@ -1325,8 +1295,6 @@ async def request_grant(req: GrantRequest):
         raise HTTPException(400, "Level 1 requires messageId")
     if req.level == 2 and not req.query:
         raise HTTPException(400, "Level 2 requires query")
-    if req.callbackUrl and not _is_safe_callback_url(req.callbackUrl):
-        raise HTTPException(400, "callbackUrl must be an HTTPS URL to an allowed hostname")
 
     # Determine duration (defaults are short, but caller can request up to 24h)
     if req.level == 1:
@@ -1364,16 +1332,10 @@ async def request_grant(req: GrantRequest):
         except Exception as e:
             log.warning("Could not fetch message metadata for grant request: %s", e)
 
-    # Hash callback token for storage; keep raw token in memory only
-    callback_token_hash = ""
-    if req.callbackToken:
-        callback_token_hash = hashlib.sha256(req.callbackToken.encode()).hexdigest()
-
     meta_dict = {
         "subject": subject_line,
         "sender": sender,
-        "callbackCfAuth": req.callbackCfAuth,
-        "callbackTokenHash": callback_token_hash or None,
+        "callback": req.callback,
         "callbackSessionKey": req.callbackSessionKey,
     }
 
@@ -1382,8 +1344,8 @@ async def request_grant(req: GrantRequest):
         conn.execute(
             "INSERT INTO grants "
             "(id, level, status, message_id, query, description, "
-            "approval_token, signal_code, created_at, duration_minutes, metadata, callback_url) "
-            "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "approval_token, signal_code, created_at, duration_minutes, metadata) "
+            "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 grant_id,
                 req.level,
@@ -1395,16 +1357,11 @@ async def request_grant(req: GrantRequest):
                 now.isoformat(),
                 duration,
                 json.dumps(meta_dict),
-                req.callbackUrl,
             ),
         )
         conn.commit()
     finally:
         conn.close()
-
-    # Store raw callback token in memory for later use
-    if req.callbackToken:
-        _pending_callback_tokens[grant_id] = req.callbackToken
 
     approval_url = f"{CONFIG['approval_url_base']}/approve/{approval_token}"
 

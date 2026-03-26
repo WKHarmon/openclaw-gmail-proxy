@@ -12,7 +12,11 @@
     "webhook_token": ""
   },
   "approval_url_base": "https://approval.your-domain.com",
-  "allowed_callback_domains": [],
+  "callback": {
+    "url": "https://your-openclaw-domain.com/hooks/gmail-grant",
+    "cf_auth": true,
+    "hooks_token_vault_path": "secret/your-project/gateway"
+  },
   "rate_limit": {
     "grant_requests_per_minute": 5
   },
