@@ -46,7 +46,7 @@ async def fire_grant_callback(
         headers["CF-Access-Client-Id"] = cf_client_id
         headers["CF-Access-Client-Secret"] = cf_client_secret
     if hooks_token:
-        headers["Authorization"] = f"Bearer {hooks_token}"
+        headers["X-Gitlab-Token"] = hooks_token
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
