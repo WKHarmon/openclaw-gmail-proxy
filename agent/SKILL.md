@@ -144,7 +144,7 @@ Tiered SSH certificate access via OpenBao (Vault) SSH CA. The gateway signs shor
 | Level | Access | Approval | Default Duration |
 |-------|--------|----------|-----------------|
 | 0 | List available hosts and host groups | None | Always on |
-| 1 | SSH certificate for a single host | The approver approves via Signal | 5 min (single cert, then consumed) |
+| 1 | SSH certificate for a single host | The approver approves via Signal | 5 min |
 | 2 | SSH certificate for a host group | The approver approves via Signal | 30 min |
 | 3 | SSH certificate for any principal (broad access) | The approver approves via Signal | 15 min |
 
@@ -197,15 +197,15 @@ Response:
 }
 ```
 
-Level 1 grants are **consumed** after the first certificate is issued.
+SSH grants are **not consumed** when a certificate is issued. The certificate itself is short-lived, but you can mint another certificate from the same still-active grant until the grant expires.
 
 ## Level 1 SSH Grant Lifecycle
 
-Level 1 SSH grants have a "single cert" semantic:
+Level 1 SSH grants have a renewable-within-window semantic:
 
 1. Grant is created with `status: pending`
 2. Approver approves -> `status: active`, timer starts
-3. First `POST /api/ssh/credentials` that issues a cert -> `status: consumed`
+3. Any number of `POST /api/ssh/credentials` calls may issue fresh short-lived certs while the grant remains active
 4. Grant expires when the timer runs out -> `status: expired`
 
 ---
@@ -432,7 +432,7 @@ curl -s -X POST "$BASE/api/grants/request" \
 ## SSH
 - **Use Level 0 to discover available hosts first.** `GET /api/ssh/hosts` tells you what hosts and principals are configured before you request access.
 - **Request the minimum level needed.** Level 1 for a single host, Level 2 for a host group, Level 3 only when broad principal access is truly necessary.
-- **Certificates auto-expire -- no need to revoke.** SSH certs are self-expiring based on the grant duration. Unlike Gmail grants, there is no benefit to revoking them early since the cert itself has a built-in TTL.
+- **SSH certs auto-expire, but grants may outlive them.** Reuse the same active SSH grant to mint a fresh cert when needed; do not request a new approval just because the short-lived cert expired.
 - **Generate a fresh keypair for each session.** Use ephemeral SSH keys rather than long-lived ones for better security hygiene.
 
 ---

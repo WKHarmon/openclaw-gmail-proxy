@@ -17,6 +17,10 @@ mkdir -p ~/.agent/workspace/skills/authorization-gateway
 cp agent/SKILL.md ~/.agent/workspace/skills/authorization-gateway/SKILL.md
 ```
 
+The checked-in `agent/SKILL.md` is intentionally generic. Keep repository copies free of instance-specific values such as your real gateway hostname, email address, Vault path, callback session key, agent hook path, or local skill metadata/frontmatter.
+
+If your agent runtime needs local customization, merge those settings into the installed copy **after** copying the file into your workspace. That keeps the repo reusable while still letting each deployment adapt the skill to its own environment.
+
 ### 2. Install the hook transform
 
 ```bash

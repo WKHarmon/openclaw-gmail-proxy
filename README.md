@@ -102,7 +102,7 @@ Response:
 }
 ```
 
-Possible `status` values: `pending`, `active`, `consumed` (Level 1 after body read or cert issued), `expired`, `denied`, `revoked`.
+Possible `status` values: `pending`, `active`, `consumed` (provider-specific; for example Gmail Level 1 after the first body read), `expired`, `denied`, `revoked`.
 
 ### `GET /api/grants/active`
 
@@ -420,7 +420,7 @@ Certificate-based SSH access via OpenBao (Vault) SSH secrets engine. The gateway
 | 2 | Host group certificate | Signal reply or tap link | 30 min |
 | 3 | Broad principal access | Signal reply or tap link | 15 min |
 
-Level 1 grants are single-use: after one certificate is issued, the grant is consumed.
+SSH grants are not consumed when a certificate is issued. The certificate itself is short-lived, but you can issue another certificate from the same still-active grant until the grant expires.
 
 ### SSH API Reference
 
@@ -484,6 +484,15 @@ The agent writes `signedKey` to a `-cert.pub` file alongside its private key, th
 ```bash
 ssh -i /path/to/key -o CertificateFile=/path/to/key-cert.pub deploy@web-prod-1
 ```
+
+#### Level 1 SSH Grant Lifecycle
+
+Level 1 SSH grants have a renewable-within-window semantic:
+
+1. Grant is created with `status: pending`
+2. Approver approves -> `status: active`, timer starts
+3. Any number of `POST /api/ssh/credentials` calls may issue fresh short-lived certs while the grant remains active
+4. Grant expires when the timer runs out -> `status: expired`
 
 ### SSH Grant Request Examples
 
