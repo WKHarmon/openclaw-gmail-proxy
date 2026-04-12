@@ -36,3 +36,25 @@ def load_sensitive_patterns(config: dict) -> dict:
 
 CONFIG = load_config()
 SENSITIVE = load_sensitive_patterns(CONFIG)
+
+
+def get_requestors() -> dict[str, dict]:
+    """Return the requestors map, normalizing from legacy single-agent config if needed.
+
+    New format (config.json has "requestors" key):
+        {"Lisa": {"api_key_vault_path": "...", "callback": {...}}, ...}
+
+    Legacy format (config.json has "agent_name" + "vault_api_key_path" + "callback"):
+        Auto-generates a single-entry requestors map.
+    """
+    if "requestors" in CONFIG:
+        return CONFIG["requestors"]
+
+    # Legacy single-agent config
+    name = CONFIG.get("agent_name", "Agent")
+    return {
+        name: {
+            "api_key_vault_path": CONFIG.get("vault_api_key_path", ""),
+            "callback": CONFIG.get("callback"),
+        }
+    }

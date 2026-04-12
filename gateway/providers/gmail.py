@@ -241,7 +241,7 @@ class GmailProvider:
         return defaults.get("level3_default_duration_minutes", 15)
 
     def format_signal_notification(self, grant: dict, approval_url: str) -> str:
-        agent_name = CONFIG.get("agent_name", "Agent")
+        agent_name = grant.get("requestor") or CONFIG.get("agent_name", "Agent")
         signal_code = grant["signal_code"]
         duration = grant["duration_minutes"]
 

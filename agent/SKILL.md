@@ -4,7 +4,7 @@ Tiered, time-limited access to Gmail (user@example.com) and SSH hosts via a gate
 
 ## Authentication
 
-1. **API Key** (required) -- Bearer token (from vault `secret/your-project/authorization-gateway`)
+1. **API Key** (required) -- Bearer token (from vault, path configured per requestor in the gateway's `requestors` config). Each requestor has its own API key; the gateway identifies who is making the request from the key.
 2. **Cloudflare Access** (optional) -- service token headers, only if deployed behind Cloudflare Access (from vault `secret/your-project/cloudflare-access`)
 
 ```bash

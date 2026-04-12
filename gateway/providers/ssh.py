@@ -70,7 +70,7 @@ class SSHProvider:
         return defaults.get("level3_ttl_minutes", 30)
 
     def format_signal_notification(self, grant: dict, approval_url: str) -> str:
-        agent_name = CONFIG.get("agent_name", "Agent")
+        agent_name = grant.get("requestor") or CONFIG.get("agent_name", "Agent")
         signal_code = grant["signal_code"]
         dur = _format_duration(grant["duration_minutes"])
         params = json.loads(grant.get("resource_params") or "{}")

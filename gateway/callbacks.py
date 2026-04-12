@@ -6,8 +6,6 @@ from typing import Optional
 
 import httpx
 
-from gateway.config import CONFIG
-
 log = logging.getLogger("gateway.callbacks")
 
 
@@ -16,18 +14,19 @@ async def fire_grant_callback(
     status: str,
     expires_at: Optional[str] = None,
     *,
-    cf_client_id: str = "",
-    cf_client_secret: str = "",
-    hooks_token: str = "",
+    requestor_name: str = "",
 ):
-    """POST grant status to the configured callback URL."""
-    callback_cfg = CONFIG.get("callback", {})
-    callback_url = callback_cfg.get("url", "")
-    if not callback_url:
-        return
+    """POST grant status to the requestor's configured callback URL."""
+    from gateway.app import get_requestor_callback
 
     meta = json.loads(grant.get("metadata") or "{}")
     if meta.get("callback") is False:
+        return
+
+    # Look up per-requestor callback config
+    cb_creds = get_requestor_callback(requestor_name)
+    callback_url = cb_creds.get("url", "")
+    if not callback_url:
         return
 
     payload: dict = {
@@ -42,11 +41,11 @@ async def fire_grant_callback(
         payload["sessionKey"] = meta["callbackSessionKey"]
 
     headers: dict = {"Content-Type": "application/json"}
-    if callback_cfg.get("cf_auth") and cf_client_id:
-        headers["CF-Access-Client-Id"] = cf_client_id
-        headers["CF-Access-Client-Secret"] = cf_client_secret
-    if hooks_token:
-        headers["X-Gitlab-Token"] = hooks_token
+    if cb_creds.get("cf_auth") and cb_creds.get("cf_client_id"):
+        headers["CF-Access-Client-Id"] = cb_creds["cf_client_id"]
+        headers["CF-Access-Client-Secret"] = cb_creds["cf_client_secret"]
+    if cb_creds.get("hooks_token"):
+        headers["X-Gitlab-Token"] = cb_creds["hooks_token"]
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:

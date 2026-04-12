@@ -6,6 +6,8 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
       - ./sensitive_patterns.json:/app/sensitive_patterns.json:ro
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-18795}:${PROXY_PORT:-18795}"
     env_file:
       - .env
     depends_on:

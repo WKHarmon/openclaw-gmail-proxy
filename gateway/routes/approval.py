@@ -100,7 +100,7 @@ def register(app: FastAPI, *, fire_callback):
                 )
             )
 
-        agent_name = CONFIG.get("agent_name", "Agent")
+        agent_name = grant.get("requestor") or CONFIG.get("agent_name", "Agent")
         csrf_token = _issue_csrf_token(token)
 
         # Get provider-specific details

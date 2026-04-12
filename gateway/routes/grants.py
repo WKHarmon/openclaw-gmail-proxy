@@ -9,7 +9,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from gateway.audit import audit
 from gateway.config import CONFIG, MAX_GRANT_DURATION_MINUTES
@@ -28,8 +28,9 @@ _grant_request_times: deque = deque()
 def register(app: FastAPI, *, fire_callback):
 
     @app.post("/api/grants/request")
-    async def request_grant(req: GrantRequest):
+    async def request_grant(req: GrantRequest, request: Request):
         """Request elevated access. Sends approval via Signal (link + reply code)."""
+        requestor_name = getattr(request.state, "requestor_name", None) or CONFIG.get("agent_name", "Agent")
         # Rate limiting
         now_mono = time.monotonic()
         max_per_min = CONFIG.get("rate_limit", {}).get("grant_requests_per_minute", 5)
@@ -101,8 +102,8 @@ def register(app: FastAPI, *, fire_callback):
                 "INSERT INTO grants "
                 "(id, level, status, message_id, query, description, "
                 "approval_token, signal_code, created_at, duration_minutes, "
-                "metadata, resource_type, resource_params) "
-                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "metadata, resource_type, resource_params, requestor) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     grant_id,
                     req.level,
@@ -116,6 +117,7 @@ def register(app: FastAPI, *, fire_callback):
                     json.dumps(meta_dict),
                     req.resourceType,
                     json.dumps(resource_params) if resource_params else None,
+                    requestor_name,
                 ),
             )
             conn.commit()
@@ -133,6 +135,7 @@ def register(app: FastAPI, *, fire_callback):
             "resource_type": req.resourceType,
             "resource_params": json.dumps(resource_params) if resource_params else None,
             "query": req.query,
+            "requestor": requestor_name,
         }
 
         approval_url = f"{CONFIG['approval_url_base']}/approve/{approval_token}"
@@ -149,6 +152,7 @@ def register(app: FastAPI, *, fire_callback):
             "description": req.description,
             "durationMinutes": duration,
             "status": "pending",
+            "requestor": requestor_name,
         })
 
         return {

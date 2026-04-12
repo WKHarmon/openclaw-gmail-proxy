@@ -10,7 +10,7 @@ from fastapi import FastAPI
 
 from gateway.audit import audit
 from gateway.callbacks import fire_grant_callback
-from gateway.config import CONFIG, DATA_DIR, VAULT_ENABLED
+from gateway.config import CONFIG, DATA_DIR, VAULT_ENABLED, get_requestors
 from gateway.db import db_conn, init_db
 from gateway.middleware import check_api_key
 from gateway.providers import all_providers, register_provider
@@ -21,24 +21,29 @@ log = logging.getLogger("gateway")
 
 # ── Module-level state loaded at startup ──────────────────────────────────
 
-_api_key: str = ""
-_callback_cf_client_id: str = ""
-_callback_cf_client_secret: str = ""
-_callback_hooks_token: str = ""
+# Mapping: API key -> requestor name
+_api_keys: dict[str, str] = {}
+
+# Mapping: requestor name -> callback credentials dict
+# Each dict has keys: url, cf_auth, cf_client_id, cf_client_secret, hooks_token
+_requestor_callbacks: dict[str, dict] = {}
 
 
-def get_api_key() -> str:
-    return _api_key
+def get_api_keys() -> dict[str, str]:
+    return _api_keys
+
+
+def get_requestor_callback(requestor_name: str) -> dict:
+    return _requestor_callbacks.get(requestor_name, {})
 
 
 def make_fire_callback():
     """Return an async callable for firing grant callbacks with loaded credentials."""
     async def _fire(grant, status, expires_at=None):
+        requestor = grant.get("requestor", "")
         await fire_grant_callback(
             grant, status, expires_at,
-            cf_client_id=_callback_cf_client_id,
-            cf_client_secret=_callback_cf_client_secret,
-            hooks_token=_callback_hooks_token,
+            requestor_name=requestor,
         )
     return _fire
 
@@ -93,52 +98,81 @@ async def _expire_grants_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _api_key, _callback_cf_client_id, _callback_cf_client_secret, _callback_hooks_token
+    # Load API keys and callback credentials for all requestors
+    requestors = get_requestors()
 
-    # Load API key
     if VAULT_ENABLED:
-        api_key_path = CONFIG.get("vault_api_key_path", "")
-        if api_key_path:
-            try:
-                shared = vault.read_path(api_key_path)
-                _api_key = shared["api_key"].strip()
-                log.info("API key loaded from Vault")
-            except Exception as e:
-                log.warning("Could not load API key from Vault: %s — /api/* routes are unauthenticated", e)
-        else:
-            log.warning("vault_api_key_path not set in config — /api/* routes are unauthenticated")
+        # Load shared CF Access credentials (used for callbacks behind Cloudflare)
+        shared_cf_id = ""
+        shared_cf_secret = ""
+        try:
+            shared_secrets = vault.read_all()
+            shared_cf_id = shared_secrets.get("CF-Access-Client-Id", "")
+            shared_cf_secret = shared_secrets.get("CF-Access-Client-Secret", "")
+            if shared_cf_id:
+                log.info("Shared CF Access credentials loaded from Vault")
+        except Exception as e:
+            log.warning("Could not load shared CF credentials: %s", e)
+
+        for name, rcfg in requestors.items():
+            # Load API key
+            api_key_path = rcfg.get("api_key_vault_path", "")
+            if api_key_path:
+                try:
+                    secret = vault.read_path(api_key_path)
+                    key = secret["api_key"].strip()
+                    _api_keys[key] = name
+                    log.info("API key loaded for requestor %r", name)
+                except Exception as e:
+                    log.warning("Could not load API key for requestor %r: %s", name, e)
+            else:
+                log.warning("No api_key_vault_path for requestor %r", name)
+
+            # Load callback credentials
+            cb_cfg = rcfg.get("callback")
+            if cb_cfg:
+                cb_creds = {
+                    "url": cb_cfg.get("url", ""),
+                    "cf_auth": cb_cfg.get("cf_auth", False),
+                    "cf_client_id": shared_cf_id,
+                    "cf_client_secret": shared_cf_secret,
+                    "hooks_token": "",
+                }
+                hooks_vault_path = cb_cfg.get("hooks_token_vault_path", "")
+                if hooks_vault_path:
+                    try:
+                        gw = vault.read_path(hooks_vault_path)
+                        cb_creds["hooks_token"] = gw.get("hooks_token", "")
+                        if cb_creds["hooks_token"]:
+                            log.info("Callback hooks token loaded for requestor %r", name)
+                    except Exception as e:
+                        log.warning("Could not load hooks token for requestor %r: %s", name, e)
+                _requestor_callbacks[name] = cb_creds
     else:
-        _api_key = os.environ.get("API_KEY", "").strip()
-        if _api_key:
-            log.info("API key loaded from environment")
+        # Non-Vault mode: single API key from environment (legacy)
+        env_key = os.environ.get("API_KEY", "").strip()
+        if env_key:
+            fallback_name = CONFIG.get("agent_name", "Agent")
+            _api_keys[env_key] = fallback_name
+            log.info("API key loaded from environment for %r", fallback_name)
         else:
             log.warning("API_KEY not set — /api/* routes are unauthenticated")
 
-    # Load callback credentials
-    try:
-        gmail_secrets = vault.read_all()
-        _callback_cf_client_id = gmail_secrets.get("CF-Access-Client-Id", "")
-        _callback_cf_client_secret = gmail_secrets.get("CF-Access-Client-Secret", "")
-        if _callback_cf_client_id:
-            log.info("Callback CF Access credentials loaded from Vault")
-    except Exception as e:
-        log.warning("Could not load callback CF credentials: %s", e)
-
-    # Load hooks token
-    callback_cfg = CONFIG.get("callback", {})
-    hooks_vault_path = callback_cfg.get("hooks_token_vault_path", "")
-    if hooks_vault_path and VAULT_ENABLED:
-        try:
-            gw = vault.read_path(hooks_vault_path)
-            _callback_hooks_token = gw.get("hooks_token", "")
-            if _callback_hooks_token:
-                log.info("Callback hooks token loaded from Vault")
-        except Exception as e:
-            log.warning("Could not load hooks token from Vault: %s", e)
-    elif not VAULT_ENABLED:
-        _callback_hooks_token = os.environ.get("CALLBACK_HOOKS_TOKEN", "")
-        if _callback_hooks_token:
+        hooks_token = os.environ.get("CALLBACK_HOOKS_TOKEN", "")
+        if hooks_token:
+            cb_cfg = CONFIG.get("callback", {})
+            name = CONFIG.get("agent_name", "Agent")
+            _requestor_callbacks[name] = {
+                "url": cb_cfg.get("url", ""),
+                "cf_auth": cb_cfg.get("cf_auth", False),
+                "cf_client_id": "",
+                "cf_client_secret": "",
+                "hooks_token": hooks_token,
+            }
             log.info("Callback hooks token loaded from environment")
+
+    if not _api_keys:
+        log.warning("No API keys loaded — /api/* routes are unauthenticated")
 
     if not CONFIG.get("signal", {}).get("webhook_token"):
         log.warning("signal.webhook_token not set — webhook endpoint is unauthenticated")

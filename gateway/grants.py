@@ -12,7 +12,7 @@ log = logging.getLogger("gateway.grants")
 GRANT_PUBLIC_FIELDS = (
     "id", "level", "status", "message_id", "query", "description",
     "created_at", "approved_at", "expires_at", "duration_minutes",
-    "resource_type",
+    "resource_type", "requestor",
 )
 
 
@@ -41,6 +41,7 @@ def activate_grant(grant: dict, via: str = "url") -> datetime:
         "level": grant["level"],
         "expiresAt": expires_at.isoformat(),
         "approvedVia": via,
+        "requestor": grant.get("requestor"),
     })
     return expires_at
 
@@ -59,6 +60,7 @@ def deny_grant(grant: dict, via: str = "url"):
         "resourceType": grant.get("resource_type", "gmail"),
         "level": grant["level"],
         "deniedVia": via,
+        "requestor": grant.get("requestor"),
     })
 
 

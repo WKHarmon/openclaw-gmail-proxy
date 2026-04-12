@@ -33,6 +33,7 @@ def init_db():
         "ALTER TABLE grants ADD COLUMN callback_url TEXT",
         "ALTER TABLE grants ADD COLUMN resource_type TEXT NOT NULL DEFAULT 'gmail'",
         "ALTER TABLE grants ADD COLUMN resource_params TEXT",
+        "ALTER TABLE grants ADD COLUMN requestor TEXT",
     ]
     for stmt in migrations:
         try:
