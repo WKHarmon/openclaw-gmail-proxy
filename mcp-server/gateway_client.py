@@ -39,8 +39,15 @@ class GatewayClient:
         description: str,
         duration_minutes: int | None = None,
         host_group: str | None = None,
+        allow_replace_shorter_grant: bool = False,
     ) -> dict:
-        """POST /api/grants/request — request SSH access."""
+        """POST /api/grants/request — request SSH access.
+
+        The gateway now deduplicates against active matching grants. If a
+        matching active grant exists and ``allow_replace_shorter_grant`` is
+        False (default), it returns that grant with ``action='reused_active_grant'``
+        instead of creating a new pending approval.
+        """
         payload: dict = {
             "resourceType": "ssh",
             "level": level,
@@ -54,6 +61,8 @@ class GatewayClient:
             payload["hostGroup"] = host_group
         if duration_minutes:
             payload["durationMinutes"] = duration_minutes
+        if allow_replace_shorter_grant:
+            payload["allowReplaceShorterGrant"] = True
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -85,13 +94,63 @@ class GatewayClient:
             resp.raise_for_status()
             return resp.json()
 
+
     async def get_credentials(self, grant_id: str, public_key: str) -> dict:
-        """POST /api/ssh/credentials — issue a signed SSH certificate."""
+        """POST /api/ssh/credentials — issue a cert against an explicit grantId."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 self._url("/api/ssh/credentials"),
                 headers=self._headers,
                 json={"grantId": grant_id, "publicKey": public_key},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_credentials_for_scope(
+        self,
+        *,
+        public_key: str,
+        level: int,
+        principal: str,
+        description: str,
+        host: str | None = None,
+        host_group: str | None = None,
+        role: str | None = None,
+        duration_minutes: int | None = None,
+        allow_replace_shorter_grant: bool = False,
+    ) -> dict:
+        """POST /api/ssh/credentials in scope mode — one call that either:
+
+          * reuses an active matching grant and returns a minted cert, or
+          * creates a new pending approval request (no cert yet).
+
+        The response includes ``certificateIssued: true|false``, ``action``,
+        ``grantId``, and ``reused``. When a cert is issued it also includes
+        ``signedKey`` / ``serial`` / ``validBefore``.
+        """
+        payload: dict = {
+            "publicKey": public_key,
+            "level": level,
+            "principal": principal,
+            "description": description,
+            "callback": False,
+        }
+        if host:
+            payload["host"] = host
+        if host_group:
+            payload["hostGroup"] = host_group
+        if role:
+            payload["role"] = role
+        if duration_minutes:
+            payload["durationMinutes"] = duration_minutes
+        if allow_replace_shorter_grant:
+            payload["allowReplaceShorterGrant"] = True
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                self._url("/api/ssh/credentials"),
+                headers=self._headers,
+                json=payload,
             )
             resp.raise_for_status()
             return resp.json()

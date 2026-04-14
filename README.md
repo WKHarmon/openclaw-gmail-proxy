@@ -68,6 +68,34 @@ Additional fields for SSH grants:
 | `principal` | string | Level 1 (optional), Level 3 (required) | Unix username for the certificate |
 | `hostGroup` | string | Level 2 only | Host group name (must be in config) |
 | `role` | string | no | Vault SSH role override (defaults to host/group config) |
+| `allowReplaceShorterGrant` | bool | no | Default false. By default SSH requests dedupe against an active matching grant (see below). Set to true to bypass dedupe when the existing grant's remaining duration is shorter than what you now need, and force a fresh approval request. |
+
+### SSH grant dedupe
+
+When `resourceType == "ssh"`, the gateway checks for an existing active matching grant before creating a new one. Match criteria: same requestor, same `level`, same `principal`, same `host` (L1) / `hostGroup` (L2), and — when the caller explicitly specified a `role` — same `role`. If a match exists and `allowReplaceShorterGrant` is false (default), the gateway returns the existing active grant instead of creating a new pending one. This suppresses spurious approval prompts when an earlier grant is still valid.
+
+Reuse response shape:
+```json
+{
+  "grantId": "g_...",
+  "status": "active",
+  "resourceType": "ssh",
+  "level": 1,
+  "durationMinutes": 30,
+  "action": "reused_active_grant",
+  "reused": true,
+  "durationSatisfied": true,
+  "shorterThanRequested": false,
+  "requestedDurationSeconds": 1800,
+  "remainingDurationSeconds": 1720,
+  "expiresAt": "2026-04-14T21:00:00+00:00",
+  "message": "Reused active SSH grant."
+}
+```
+
+If the active grant's remaining duration is shorter than requested, it is still reused but the response reports `"durationSatisfied": false` and `"shorterThanRequested": true`. To force a fresh, longer approval, resend the same request with `"allowReplaceShorterGrant": true`; the response then includes `"action": "requested_replacement_grant_due_to_short_duration"` and `"previousGrantId"`.
+
+New-request response shape also gains `"action"` (`"requested_new_grant"` or `"requested_replacement_grant_due_to_short_duration"`) and `"reused": false`.
 
 Response:
 ```json
@@ -455,7 +483,9 @@ Response:
 
 ##### `POST /api/ssh/credentials`
 
-Issue a signed SSH certificate using an active SSH grant.
+Issue a signed SSH certificate. Two calling modes:
+
+**Mode 1 — by `grantId`** (classic): you already hold an active grant ID and just want a cert.
 
 Request body:
 ```json
@@ -465,19 +495,68 @@ Request body:
 }
 ```
 
+**Mode 2 — by scope** (one-call): omit `grantId` and describe the access you want. The gateway either reuses a matching active grant and mints a cert in the same response, or creates a new pending approval and returns `certificateIssued: false` with the pending `grantId`.
+
+Request body (scope mode):
+```json
+{
+  "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...",
+  "level": 1,
+  "host": "web-prod-1",
+  "principal": "deploy",
+  "description": "Deploy latest release",
+  "durationMinutes": 15,
+  "allowReplaceShorterGrant": false
+}
+```
+
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `grantId` | string | yes | An active SSH grant ID |
-| `publicKey` | string | yes | The agent's SSH public key (e.g. `ssh-ed25519 ...`) |
+| `publicKey` | string | yes | The agent's SSH public key |
+| `grantId` | string | mode 1 | An active SSH grant ID |
+| `level` | int | mode 2 | Access level (1/2/3) |
+| `host` | string | mode 2, L1 | Target hostname |
+| `hostGroup` | string | mode 2, L2 | Host group name |
+| `principal` | string | mode 2 | SSH username for the certificate |
+| `description` | string | mode 2 | Human-readable reason (shown to approver if approval is needed) |
+| `role` | string | no | Vault SSH role override |
+| `durationMinutes` | int | no | Requested duration |
+| `allowReplaceShorterGrant` | bool | no | If true in mode 2, bypass dedupe against a shorter active grant and force a new approval |
+| `callbackSessionKey` | string | no | Echoed back in callback payload if a new grant is created |
 
-Response:
+Response (cert issued — mode 1, or mode 2 with reuse):
 ```json
 {
   "signedKey": "ssh-ed25519-cert-v01@openssh.com AAAAC3...",
   "serial": "abc123456",
-  "validBefore": "2026-03-23T19:42:01.964774+00:00"
+  "validBefore": "2026-03-23T19:42:01.964774+00:00",
+  "grantId": "g_11155f2e244bc44e",
+  "certificateIssued": true,
+  "action": "reused_active_grant",
+  "reused": true,
+  "durationSatisfied": true,
+  "shorterThanRequested": false
 }
 ```
+
+(In mode 1, the `action` / `reused` / `durationSatisfied` / `shorterThanRequested` fields are omitted — the caller already chose the grant.)
+
+Response (mode 2, no active grant → pending approval):
+```json
+{
+  "grantId": "g_...",
+  "status": "pending",
+  "resourceType": "ssh",
+  "level": 1,
+  "durationMinutes": 30,
+  "action": "requested_new_grant",
+  "reused": false,
+  "certificateIssued": false,
+  "message": "Approval request sent. Poll GET /api/grants/g_... for status."
+}
+```
+
+After the approval callback fires, the caller can retry the same `POST /api/ssh/credentials` request (scope mode) — this time it will dedupe onto the newly-active grant and mint a cert.
 
 The agent writes `signedKey` to a `-cert.pub` file alongside its private key, then connects normally:
 

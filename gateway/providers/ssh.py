@@ -5,13 +5,13 @@ import logging
 from html import escape
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from gateway.audit import audit
 from gateway.config import CONFIG
 from gateway.db import db_conn
 from gateway.grants import get_active_grant
-from gateway.models import SSHCredentialRequest
+from gateway.models import GrantRequest, SSHCredentialRequest
 from gateway.vault import vault
 
 log = logging.getLogger("gateway.providers.ssh")
@@ -178,9 +178,78 @@ def _register_ssh_routes(app: FastAPI):
         return {"hosts": hosts_out, "hostGroups": groups_out}
 
     @app.post("/api/ssh/credentials")
-    async def issue_ssh_credentials(req: SSHCredentialRequest):
-        """Issue a signed SSH certificate using an active SSH grant."""
-        grant = get_active_grant(req.grantId)
+    async def issue_ssh_credentials(req: SSHCredentialRequest, request: Request):
+        """Issue a signed SSH certificate.
+
+        Two modes:
+
+        * **By grantId** — classic path: caller passes ``grantId`` + ``publicKey``
+          and we mint a cert.
+        * **By scope** — one-call path: caller passes
+          ``{level, host/hostGroup, principal, description, publicKey}``.
+          We look up an active matching grant; if found we mint a cert against
+          it, if not we create a new pending approval and return the pending
+          grantId with ``certificateIssued: false``.
+        """
+        requestor_name = (
+            getattr(request.state, "requestor_name", None)
+            or CONFIG.get("agent_name", "Agent")
+        )
+
+        reuse_meta: dict | None = None
+
+        if req.grantId:
+            # Mode 1: classic path — explicit grantId
+            grant_id = req.grantId
+        else:
+            # Mode 2: scope-based. Build a GrantRequest and run it through
+            # the shared create-or-reuse helper (same dedupe rules as
+            # POST /api/grants/request).
+            if req.level is None or not req.principal or not req.description:
+                raise HTTPException(
+                    400,
+                    "Scope-based credential issuance requires level, "
+                    "principal, and description (or pass grantId instead).",
+                )
+
+            from gateway.routes.grants import create_or_reuse_grant
+
+            gr = GrantRequest(
+                resourceType="ssh",
+                level=req.level,
+                description=req.description,
+                durationMinutes=req.durationMinutes,
+                callback=req.callback,
+                callbackSessionKey=req.callbackSessionKey,
+                host=req.host,
+                hostGroup=req.hostGroup,
+                principal=req.principal,
+                role=req.role,
+                allowReplaceShorterGrant=req.allowReplaceShorterGrant,
+            )
+            create_resp = await create_or_reuse_grant(gr, requestor_name)
+
+            if create_resp.get("status") != "active":
+                # New pending approval — no cert yet. Return the grant-create
+                # response plus an explicit certificateIssued flag so callers
+                # can branch without ambiguity.
+                out = dict(create_resp)
+                out["certificateIssued"] = False
+                return out
+
+            grant_id = create_resp["grantId"]
+            reuse_meta = {
+                "action": create_resp.get("action"),
+                "reused": create_resp.get("reused", True),
+                "durationSatisfied": create_resp.get("durationSatisfied"),
+                "shorterThanRequested": create_resp.get("shorterThanRequested"),
+                "requestedDurationSeconds": create_resp.get("requestedDurationSeconds"),
+                "remainingDurationSeconds": create_resp.get("remainingDurationSeconds"),
+                "expiresAt": create_resp.get("expiresAt"),
+            }
+
+        # ── Mint cert against grant_id ─────────────────────────────────
+        grant = get_active_grant(grant_id)
         if not grant or grant.get("resource_type") != "ssh":
             raise HTTPException(403, "No active SSH grant with this ID")
 
@@ -217,14 +286,21 @@ def _register_ssh_routes(app: FastAPI):
             "principal": principal,
             "role": role,
             "serial": result.get("serial_number", ""),
+            "scopeMode": reuse_meta is not None,
         })
 
         # SSH grants are NOT consumed after a single use because certificates
         # are short-lived and must be renewed within the grant window.
         # The grant naturally expires via expires_at.
 
-        return {
+        response: dict = {
             "signedKey": result["signed_key"],
             "serial": result.get("serial_number", ""),
             "validBefore": grant["expires_at"],
+            "grantId": grant["id"],
+            "certificateIssued": True,
         }
+        if reuse_meta is not None:
+            # Scope-mode call — surface dedupe/reuse metadata alongside the cert.
+            response.update({k: v for k, v in reuse_meta.items() if v is not None})
+        return response

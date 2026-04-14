@@ -179,21 +179,50 @@ Response:
 ## SSH Grant-Gated Endpoint
 
 ### `POST /api/ssh/credentials`
-Issue a signed SSH certificate using an active SSH grant.
+Issue a signed SSH certificate. Two calling modes:
+
+**Scope mode (preferred, one call):** describe the access you want and let the gateway decide whether to reuse an active grant or create a new approval request.
+
+```json
+{
+  "publicKey": "ssh-ed25519 AAAA...",
+  "level": 1,
+  "host": "web-prod-1",
+  "principal": "deploy",
+  "description": "Deploy latest release"
+}
+```
+
+If an active matching grant exists: cert is minted in the same response.
+```json
+{
+  "certificateIssued": true,
+  "reused": true,
+  "action": "reused_active_grant",
+  "grantId": "g_...",
+  "signedKey": "ssh-ed25519-cert-v01@openssh.com AAAA...",
+  "serial": "1234567890",
+  "validBefore": "2026-03-26T12:30:00+00:00"
+}
+```
+
+If no active matching grant: new approval is requested and no cert is issued yet. After the approval callback fires, re-send the same request and it will dedupe onto the now-active grant.
+```json
+{
+  "certificateIssued": false,
+  "reused": false,
+  "action": "requested_new_grant",
+  "grantId": "g_...",
+  "status": "pending"
+}
+```
+
+**Classic grantId mode:** you already have an active `grantId` (e.g. from a callback payload) and just want a cert.
 
 ```json
 {
   "grantId": "g_...",
   "publicKey": "ssh-ed25519 AAAA..."
-}
-```
-
-Response:
-```json
-{
-  "signedKey": "ssh-ed25519-cert-v01@openssh.com AAAA...",
-  "serial": "1234567890",
-  "validBefore": "2026-03-26T12:30:00+00:00"
 }
 ```
 
@@ -250,6 +279,30 @@ When you need elevated access (reading email bodies, signing SSH certs), request
 | `principal` | Level 1 optional, Level 3 required | SSH principal (username) for the certificate |
 | `hostGroup` | Level 2 only | Host group name (must match a configured group) |
 | `role` | no | Vault SSH role to use (defaults to the host/group's configured role) |
+| `allowReplaceShorterGrant` | no | Default false. When true, bypass dedupe against a matching active grant whose remaining duration is shorter than requested, and force a fresh approval flow. Use this only when you actually need a longer grant than the one already active. |
+
+### SSH grant dedupe / reuse
+
+The gateway deduplicates SSH grant requests. If you POST `/api/grants/request` for an SSH scope (level + host/hostGroup + principal + role) that already has an active matching grant for your requestor, the response is NOT a new pending approval — it echoes the existing grant:
+
+```json
+{
+  "grantId": "g_...",
+  "status": "active",
+  "action": "reused_active_grant",
+  "reused": true,
+  "durationSatisfied": true,
+  "shorterThanRequested": false,
+  "resourceType": "ssh",
+  "durationMinutes": 30,
+  "expiresAt": "2026-04-14T21:00:00+00:00",
+  "message": "Reused active SSH grant."
+}
+```
+
+If the existing active grant's remaining lifetime is shorter than the duration you asked for, you still get the active grant back — with `"durationSatisfied": false` and `"shorterThanRequested": true` plus `requestedDurationSeconds` and `remainingDurationSeconds`. If that short remaining window is fine for what you're doing, just mint a cert against `grantId`. If not, send the same request again with `"allowReplaceShorterGrant": true` — that forces a new approval request, and the response carries `"action": "requested_replacement_grant_due_to_short_duration"` and `"previousGrantId"` linking to the too-short grant.
+
+**Do not poll `GET /api/grants/active` and match by hand.** Let the gateway do it.
 
 Callbacks fire automatically on approval/denial. The gateway POSTs to the configured callback URL with your session key, waking your session.
 
@@ -369,33 +422,28 @@ curl -s "$BASE/api/ssh/hosts" ...
 # Returns hosts with their principals, roles, and descriptions
 ```
 
-## SSH: Get a certificate for a specific host (needs Level 1 approval)
+## SSH: Get a certificate for a specific host (one call)
 ```bash
-# 1. Check available hosts
+# 1. (Optional) Check available hosts
 curl -s "$BASE/api/ssh/hosts" ...
-# Note the host name and available principals
 
-# 2. Request SSH access with callback
-curl -s -X POST "$BASE/api/grants/request" \
+# 2. One call to /api/ssh/credentials in scope mode. If a matching active
+#    grant exists you get a cert back immediately; otherwise a new approval
+#    is created and you retry after the callback fires.
+curl -s -X POST "$BASE/api/ssh/credentials" \
   -H "Content-Type: application/json" \
   -d '{
-    "resourceType": "ssh",
+    "publicKey": "ssh-ed25519 AAAA...",
     "level": 1,
     "host": "web-prod-1",
     "principal": "deploy",
     "description": "Deploy latest release to production",
     "callbackSessionKey": "agent:main:main"
   }'
-# Note the grantId, then STOP and wait -- the callback will wake your session when approved
-
-# 3. After callback fires, issue a signed certificate
-curl -s -X POST "$BASE/api/ssh/credentials" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "grantId": "GRANT_ID",
-    "publicKey": "ssh-ed25519 AAAA..."
-  }'
-# Returns signedKey, serial, and validBefore
+# If certificateIssued==true: use signedKey + serial + validBefore directly.
+# If certificateIssued==false / status==pending: STOP and wait — the
+# callback wakes your session. Then re-send the same request; this time
+# the gateway reuses the now-active grant and mints a cert.
 ```
 
 ## SSH: Access a host group (needs Level 2 approval)
@@ -432,7 +480,9 @@ curl -s -X POST "$BASE/api/grants/request" \
 ## SSH
 - **Use Level 0 to discover available hosts first.** `GET /api/ssh/hosts` tells you what hosts and principals are configured before you request access.
 - **Request the minimum level needed.** Level 1 for a single host, Level 2 for a host group, Level 3 only when broad principal access is truly necessary.
-- **SSH certs auto-expire, but grants may outlive them.** Reuse the same active SSH grant to mint a fresh cert when needed; do not request a new approval just because the short-lived cert expired.
+- **Do not manually orchestrate "list grants → pick one → mint cert".** The gateway dedupes automatically. Just `POST /api/grants/request` (or call `ssh_ensure_credentials` via MCP) — if a matching active grant exists the response will come back with `"action": "reused_active_grant"` and the same `grantId`, and you can mint a fresh cert against it. No approval prompt is sent.
+- **Shorter-than-requested active grants are reused by default.** The response sets `shorterThanRequested: true` / `durationSatisfied: false`. Only if you genuinely need longer access should you re-send the request with `"allowReplaceShorterGrant": true` to force a fresh, longer approval.
+- **SSH certs auto-expire, but grants may outlive them.** Mint a fresh cert from the same active grant when needed; never request a new approval just because the short-lived cert expired.
 - **Generate a fresh keypair for each session.** Use ephemeral SSH keys rather than long-lived ones for better security hygiene.
 
 ---
