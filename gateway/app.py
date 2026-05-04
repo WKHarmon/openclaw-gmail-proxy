@@ -98,8 +98,13 @@ async def _expire_grants_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load API keys and callback credentials for all requestors
+    # Load API keys and callback credentials for all requestors. Clear any
+    # previous in-process state first so reload/test lifespans cannot carry
+    # stale credentials forward.
+    _api_keys.clear()
+    _requestor_callbacks.clear()
     requestors = get_requestors()
+    api_key_load_errors: list[str] = []
 
     if VAULT_ENABLED:
         # Load shared CF Access credentials (used for callbacks behind Cloudflare)
@@ -124,9 +129,12 @@ async def lifespan(app: FastAPI):
                     _api_keys[key] = name
                     log.info("API key loaded for requestor %r", name)
                 except Exception as e:
-                    log.warning("Could not load API key for requestor %r: %s", name, e)
+                    log.error("Could not load API key for requestor %r: %s", name, e)
+                    api_key_load_errors.append(f"{name}: {e}")
             else:
-                log.warning("No api_key_vault_path for requestor %r", name)
+                msg = f"No api_key_vault_path for requestor {name!r}"
+                log.error(msg)
+                api_key_load_errors.append(msg)
 
             # Load callback credentials
             cb_cfg = rcfg.get("callback")
@@ -171,8 +179,14 @@ async def lifespan(app: FastAPI):
             }
             log.info("Callback hooks token loaded from environment")
 
+    if api_key_load_errors:
+        raise RuntimeError(
+            "Required API key secrets could not be loaded: "
+            + "; ".join(api_key_load_errors)
+        )
+
     if not _api_keys:
-        log.warning("No API keys loaded — /api/* routes are unauthenticated")
+        raise RuntimeError("No API keys loaded; refusing to start with /api/* unauthenticated")
 
     if not CONFIG.get("signal", {}).get("webhook_token"):
         log.warning("signal.webhook_token not set — webhook endpoint is unauthenticated")
